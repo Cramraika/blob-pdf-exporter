@@ -38,6 +38,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install cryptography (for SA JWT signing)
+        run: pip install --quiet cryptography
+
+      - name: Decode SA JSON
+        env:
+          CHROME_SA_JSON_B64: ${{ secrets.CHROME_SA_JSON_B64 }}
+        run: |
+          if [ -z "$CHROME_SA_JSON_B64" ]; then
+            echo "::warning::CHROME_SA_JSON_B64 secret not set — store ops will be skipped"
+            echo "CHROME_SA_JSON=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/cws"
+          echo "$CHROME_SA_JSON_B64" | base64 -d > "$RUNNER_TEMP/cws/sa.json"
+          chmod 600 "$RUNNER_TEMP/cws/sa.json"
+          echo "CHROME_SA_JSON=$RUNNER_TEMP/cws/sa.json" >> "$GITHUB_ENV"
+
       - name: Pre-flight — manifest version matches tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -68,47 +85,31 @@ jobs:
           sha256sum "$ZIP_NAME"
 
       - name: Status (current item state)
+        if: env.CHROME_SA_JSON != ''
         env:
-          CHROME_OAUTH_CLIENT_ID: ${{ secrets.CHROME_OAUTH_CLIENT_ID }}
-          CHROME_OAUTH_CLIENT_SECRET: ${{ secrets.CHROME_OAUTH_CLIENT_SECRET }}
-          CHROME_OAUTH_REFRESH_TOKEN: ${{ secrets.CHROME_OAUTH_REFRESH_TOKEN }}
+          CHROME_PUBLISHER_EMAIL: ${{ secrets.CHROME_PUBLISHER_EMAIL }}
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
         run: |
-          if [ -z "$CHROME_EXTENSION_ID" ]; then
-            echo "secrets not configured yet — status step skipped"
-            echo "see docs/store/SETUP.md for one-time setup"
-            exit 0
-          fi
           python3 scripts/chrome-store-publisher.py status
 
       - name: Upload to Chrome Web Store
+        if: env.CHROME_SA_JSON != ''
         env:
-          CHROME_OAUTH_CLIENT_ID: ${{ secrets.CHROME_OAUTH_CLIENT_ID }}
-          CHROME_OAUTH_CLIENT_SECRET: ${{ secrets.CHROME_OAUTH_CLIENT_SECRET }}
-          CHROME_OAUTH_REFRESH_TOKEN: ${{ secrets.CHROME_OAUTH_REFRESH_TOKEN }}
+          CHROME_PUBLISHER_EMAIL: ${{ secrets.CHROME_PUBLISHER_EMAIL }}
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
         run: |
-          if [ -z "$CHROME_EXTENSION_ID" ]; then
-            echo "secrets not configured yet — upload skipped"
-            exit 0
-          fi
           python3 scripts/chrome-store-publisher.py upload \
             --zip "${{ steps.pack.outputs.zip_name }}"
 
       - name: Publish (workflow_dispatch only, if target != skip)
         if: |
+          env.CHROME_SA_JSON != '' &&
           github.event_name == 'workflow_dispatch' &&
           github.event.inputs.publish_target != 'skip'
         env:
-          CHROME_OAUTH_CLIENT_ID: ${{ secrets.CHROME_OAUTH_CLIENT_ID }}
-          CHROME_OAUTH_CLIENT_SECRET: ${{ secrets.CHROME_OAUTH_CLIENT_SECRET }}
-          CHROME_OAUTH_REFRESH_TOKEN: ${{ secrets.CHROME_OAUTH_REFRESH_TOKEN }}
+          CHROME_PUBLISHER_EMAIL: ${{ secrets.CHROME_PUBLISHER_EMAIL }}
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
         run: |
-          if [ -z "$CHROME_EXTENSION_ID" ]; then
-            echo "secrets not configured yet — publish skipped"
-            exit 0
-          fi
           python3 scripts/chrome-store-publisher.py publish \
             --target "${{ github.event.inputs.publish_target }}"
 
@@ -125,11 +126,12 @@ jobs:
           {
             echo "## Chrome Web Store Release — v${{ steps.pack.outputs.version }}"
             echo ""
-            echo "- Zip packed: ${{ steps.pack.outputs.zip_name }}"
+            echo "- Zip packed: \`${{ steps.pack.outputs.zip_name }}\`"
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Ref: ${{ github.ref_name }}"
-            if [ "${{ secrets.CHROME_EXTENSION_ID && 'yes' || 'no' }}" = "no" ]; then
-              echo ""
-              echo "**Note:** secrets not configured. See \`docs/store/SETUP.md\`."
+            if [ -n "$CHROME_SA_JSON" ]; then
+              echo "- Auth: Service Account (✓ enabled)"
+            else
+              echo "- Auth: not configured — see \`docs/store/SETUP.md\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

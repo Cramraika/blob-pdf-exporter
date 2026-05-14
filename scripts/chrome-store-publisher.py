@@ -2,44 +2,65 @@
 """
 chrome-store-publisher.py — Chrome Web Store API CLI.
 
-Mirrors the pattern of `~/AndroidStudioProjects/pulseboard/scripts/google-play-publisher.py`
-(Google Play Publisher API) but targets the Chrome Web Store Items API:
+Mirrors `~/AndroidStudioProjects/pulseboard/scripts/google-play-publisher.py`
+(Google Play Publisher API) but targets the Chrome Web Store Items API v1.1:
 https://developer.chrome.com/docs/webstore/using-api
 
-Auth: OAuth2 refresh-token flow. One-time browser dance produces a long-lived
-refresh_token that survives indefinitely (until revoked). Subsequent calls
-exchange the refresh_token for short-lived access_tokens — fully headless.
+Auth (two supported modes, in priority order):
 
-Required env vars (or pass as CLI args):
+  1. **Service Account + publisherEmail (default; pulseboard-compatible).**
+     Reads SA private key JSON, mints a JWT-bearer assertion, exchanges
+     for a Bearer token, attaches `publisherEmail=<dev account>` to every
+     request. The SA must be registered as a member of the publisher's
+     CWS account (Chrome Web Store dashboard → Account → Add member).
+
+  2. **OAuth refresh-token (fallback / non-Workspace dev accounts).**
+     Uses CHROME_OAUTH_CLIENT_ID + CHROME_OAUTH_CLIENT_SECRET +
+     CHROME_OAUTH_REFRESH_TOKEN. Triggered when CHROME_SA_JSON env var
+     is unset OR --auth oauth flag is passed. Use `auth-bootstrap`
+     subcommand to capture the refresh_token via a one-time browser dance.
+
+Required env vars (SA mode — default):
+    CHROME_SA_JSON              Path to SA JSON (default: ~/.config/google-play/sa.json)
+    CHROME_PUBLISHER_EMAIL      Publisher account email (e.g. chinu.ramraika@gmail.com)
+    CHROME_EXTENSION_ID         Item ID (assigned on first POST /items)
+
+Required env vars (OAuth mode):
     CHROME_OAUTH_CLIENT_ID
     CHROME_OAUTH_CLIENT_SECRET
     CHROME_OAUTH_REFRESH_TOKEN
-    CHROME_EXTENSION_ID         (item ID assigned by CWS on first manual upload)
+    CHROME_EXTENSION_ID
 
 Subcommands:
-    auth-bootstrap    Interactive: open browser → operator approves → capture
-                      refresh_token. Run once locally, NOT in CI.
+    auth-bootstrap    OAuth-only: capture refresh_token via local browser dance.
+    insert            POST /items — creates NEW item; CWS assigns extension ID.
+                      Use this for a fresh extension that doesn't have an ID yet.
+    upload            PUT zip → /upload/...items/{id} (updates existing item).
     status            GET /items/{id} — return uploadState + draftStatus.
-    upload            PUT zip → /upload/chromewebstore/v1.1/items/{id}.
     publish           POST /items/{id}/publish?publishTarget=...
 
 Common usage:
-    # One-time (operator-local; opens browser):
-    python3 scripts/chrome-store-publisher.py auth-bootstrap
+    # Create the item the first time (assigns extension ID):
+    python3 scripts/chrome-store-publisher.py insert --zip dist/ext.zip
 
-    # In CI / repeat (headless):
-    python3 scripts/chrome-store-publisher.py status
+    # Update existing item:
     python3 scripts/chrome-store-publisher.py upload --zip dist/ext.zip
-    python3 scripts/chrome-store-publisher.py publish --target default
+
+    # State check:
+    python3 scripts/chrome-store-publisher.py status
+
+    # Publish:
     python3 scripts/chrome-store-publisher.py publish --target trustedTesters
+    python3 scripts/chrome-store-publisher.py publish --target default
 
 References:
     https://developer.chrome.com/docs/webstore/using-api
-    https://developers.google.com/identity/protocols/oauth2/native-app
+    https://developer.chrome.com/docs/webstore/group-publishers
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import http.server
 import json
 import os
@@ -47,6 +68,7 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -64,28 +86,24 @@ REDIRECT_HOST = "127.0.0.1"
 REDIRECT_PORT = 8765
 REDIRECT_PATH = "/oauth/callback"
 
+DEFAULT_SA_PATH = Path(
+    os.environ.get("CHROME_SA_JSON")
+    or os.environ.get("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
+    or (Path.home() / ".config" / "google-play" / "sa.json")
+).expanduser()
+
 
 class CredentialError(RuntimeError):
-    """Raised when required OAuth credentials are missing."""
+    """Raised when required credentials are missing."""
 
 
-def _read_env(name: str, required: bool = True) -> str | None:
-    val = os.environ.get(name)
-    if not val and required:
-        raise CredentialError(
-            f"Missing env var {name}. See docs/store/SETUP.md for one-time setup."
-        )
-    return val
-
-
-def _http_request(
+def _http(
     url: str,
     method: str = "GET",
     headers: dict[str, str] | None = None,
     data: bytes | None = None,
-    timeout: int = 60,
+    timeout: int = 120,
 ) -> tuple[int, dict[str, str], bytes]:
-    """Plain stdlib HTTP wrapper to avoid the requests dependency."""
     req = urllib.request.Request(url, data=data, method=method)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
@@ -101,19 +119,59 @@ def _http_request(
         return e.code, dict(e.headers or {}), body
 
 
-def exchange_refresh_for_access(
-    client_id: str, client_secret: str, refresh_token: str
-) -> str:
-    """POST /token grant_type=refresh_token. Returns access_token."""
+# ---------------------------------------------------------------------------
+# Auth — SA-mode (default; leverages pulseboard's existing SA + GCP project)
+# ---------------------------------------------------------------------------
+
+
+def _b64url(b: bytes) -> bytes:
+    return base64.urlsafe_b64encode(b).rstrip(b"=")
+
+
+def get_sa_access_token() -> str:
+    """Mint a chromewebstore-scoped access token from the service account JSON.
+
+    Auth path: pulseboard-compatible. SA must be added as a member of the
+    publisher's CWS account (operator-action; one-time browser step at
+    https://chrome.google.com/webstore/devconsole → Account → Add member).
+    """
+    if not DEFAULT_SA_PATH.is_file():
+        raise CredentialError(
+            f"CHROME_SA_JSON not found at {DEFAULT_SA_PATH}. "
+            f"Set CHROME_SA_JSON env or place sa.json there. "
+            f"See docs/store/SETUP.md."
+        )
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+    except ImportError as e:
+        raise CredentialError(
+            f"Missing dependency: {e.name}. Install with `pip install cryptography`."
+        ) from e
+
+    sa = json.loads(DEFAULT_SA_PATH.read_text())
+    header = _b64url(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    now = int(time.time())
+    claim = {
+        "iss": sa["client_email"],
+        "scope": SCOPE,
+        "aud": OAUTH_TOKEN_URL,
+        "exp": now + 3600,
+        "iat": now,
+    }
+    payload = _b64url(json.dumps(claim).encode())
+    signing_input = header + b"." + payload
+    key = serialization.load_pem_private_key(sa["private_key"].encode(), password=None)
+    sig = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+    jwt = signing_input + b"." + _b64url(sig)
+
     body = urllib.parse.urlencode(
         {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token",
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": jwt.decode(),
         }
-    ).encode("utf-8")
-    status, _, payload = _http_request(
+    ).encode()
+    status, _, payload_bytes = _http(
         OAUTH_TOKEN_URL,
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -121,28 +179,95 @@ def exchange_refresh_for_access(
     )
     if status != 200:
         raise CredentialError(
-            f"Token exchange failed (HTTP {status}): {payload.decode('utf-8', 'replace')}"
+            f"SA token exchange failed (HTTP {status}): "
+            f"{payload_bytes.decode('utf-8', 'replace')}"
+        )
+    return json.loads(payload_bytes)["access_token"]
+
+
+# ---------------------------------------------------------------------------
+# Auth — OAuth refresh-token mode (fallback; pre-existing)
+# ---------------------------------------------------------------------------
+
+
+def get_oauth_access_token(args: argparse.Namespace) -> str:
+    client_id = args.client_id or os.environ.get("CHROME_OAUTH_CLIENT_ID")
+    client_secret = args.client_secret or os.environ.get("CHROME_OAUTH_CLIENT_SECRET")
+    refresh_token = args.refresh_token or os.environ.get("CHROME_OAUTH_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh_token):
+        raise CredentialError(
+            "OAuth mode requires CHROME_OAUTH_CLIENT_ID + CHROME_OAUTH_CLIENT_SECRET + "
+            "CHROME_OAUTH_REFRESH_TOKEN. See docs/store/SETUP.md for one-time setup."
+        )
+    body = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+    ).encode()
+    status, _, payload = _http(
+        OAUTH_TOKEN_URL,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=body,
+    )
+    if status != 200:
+        raise CredentialError(
+            f"OAuth token exchange failed (HTTP {status}): "
+            f"{payload.decode('utf-8', 'replace')}"
         )
     return json.loads(payload)["access_token"]
+
+
+def get_access_token(args: argparse.Namespace) -> str:
+    """Pick SA or OAuth based on what's available; --auth flag forces."""
+    mode = args.auth
+    if mode == "oauth":
+        return get_oauth_access_token(args)
+    if mode == "sa":
+        return get_sa_access_token()
+    if DEFAULT_SA_PATH.is_file():
+        return get_sa_access_token()
+    return get_oauth_access_token(args)
 
 
 def _bearer(access_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {access_token}", "x-goog-api-version": "2"}
 
 
+def _publisher_query(args: argparse.Namespace) -> str:
+    email = args.publisher_email or os.environ.get("CHROME_PUBLISHER_EMAIL")
+    if not email:
+        return ""
+    return "publisherEmail=" + urllib.parse.quote(email)
+
+
+def _join_query(*parts: str) -> str:
+    parts = tuple(p for p in parts if p)
+    return ("?" + "&".join(parts)) if parts else ""
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+
 def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
-    """One-time interactive OAuth dance.
+    """One-time interactive OAuth dance — captures refresh_token.
 
-    Opens browser → operator approves → local 127.0.0.1 server catches the
-    redirect → exchanges authorization_code for refresh_token → prints it.
-
-    Operator copy-pastes the refresh_token into GitHub Actions secrets
-    (CHROME_OAUTH_REFRESH_TOKEN) and locally to ~/.config/cws/refresh_token
-    if they want to run from this machine too.
+    Required ONLY for OAuth mode (when SA path isn't applicable).
     """
-    client_id = args.client_id or _read_env("CHROME_OAUTH_CLIENT_ID")
-    client_secret = args.client_secret or _read_env("CHROME_OAUTH_CLIENT_SECRET")
-    assert client_id and client_secret
+    client_id = args.client_id or os.environ.get("CHROME_OAUTH_CLIENT_ID")
+    client_secret = args.client_secret or os.environ.get("CHROME_OAUTH_CLIENT_SECRET")
+    if not (client_id and client_secret):
+        print(
+            "auth-bootstrap requires CHROME_OAUTH_CLIENT_ID + CHROME_OAUTH_CLIENT_SECRET.\n"
+            "Create an OAuth Desktop client at https://console.cloud.google.com/apis/credentials.",
+            file=sys.stderr,
+        )
+        return 2
 
     redirect_uri = f"http://{REDIRECT_HOST}:{REDIRECT_PORT}{REDIRECT_PATH}"
     state = os.urandom(16).hex()
@@ -160,7 +285,6 @@ def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
             }
         )
     )
-
     received: dict[str, str] = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -176,28 +300,17 @@ def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             ok = "code" in qs and qs.get("state") == state
-            self.wfile.write(
-                (
-                    "<h2>Chrome Web Store auth — "
-                    + ("OK, close this tab." if ok else "FAILED, check terminal.")
-                    + "</h2>"
-                ).encode("utf-8")
-            )
+            msg = "OK, close this tab." if ok else "FAILED, check terminal."
+            self.wfile.write(f"<h2>Chrome Web Store auth — {msg}</h2>".encode())
 
         def log_message(self, *_: Any) -> None:
             pass
 
     with socketserver.TCPServer((REDIRECT_HOST, REDIRECT_PORT), Handler) as srv:
-        srv.timeout = 300
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
         print(f"Opening browser: {authz_url}")
-        print(
-            f"If the browser doesn't open, paste the URL above. "
-            f"Listening on {redirect_uri} for ~5 minutes."
-        )
+        print(f"Listening on {redirect_uri} for ~5 min.")
         webbrowser.open(authz_url)
-
         deadline = time.time() + 300
         while time.time() < deadline and "code" not in received:
             time.sleep(1)
@@ -207,7 +320,7 @@ def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
         print("Timed out waiting for OAuth callback.", file=sys.stderr)
         return 2
     if received.get("state") != state:
-        print("State mismatch — possible CSRF; aborting.", file=sys.stderr)
+        print("State mismatch — aborting.", file=sys.stderr)
         return 3
 
     body = urllib.parse.urlencode(
@@ -218,8 +331,8 @@ def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
         }
-    ).encode("utf-8")
-    status, _, payload = _http_request(
+    ).encode()
+    status, _, payload = _http(
         OAUTH_TOKEN_URL,
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -227,8 +340,7 @@ def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
     )
     if status != 200:
         print(
-            f"Token exchange failed (HTTP {status}): "
-            f"{payload.decode('utf-8', 'replace')}",
+            f"Token exchange failed (HTTP {status}): {payload.decode('utf-8', 'replace')}",
             file=sys.stderr,
         )
         return 4
@@ -237,40 +349,92 @@ def cmd_auth_bootstrap(args: argparse.Namespace) -> int:
     rt = data.get("refresh_token")
     if not rt:
         print(
-            "No refresh_token in response. Most common cause: prior consent "
-            "is still cached. Revoke at https://myaccount.google.com/permissions "
-            "then re-run.",
+            "No refresh_token. Revoke at https://myaccount.google.com/permissions "
+            "and re-run.",
             file=sys.stderr,
         )
-        print(json.dumps(data, indent=2), file=sys.stderr)
         return 5
-
-    print("")
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("CHROME_OAUTH_REFRESH_TOKEN:")
     print(rt)
     print("=" * 60)
-    print("")
-    print("Save as GitHub Actions secret CHROME_OAUTH_REFRESH_TOKEN")
-    print("AND (optional) locally to ~/.config/cws/refresh_token")
     return 0
 
 
-def get_access_token(args: argparse.Namespace) -> str:
-    client_id = args.client_id or _read_env("CHROME_OAUTH_CLIENT_ID")
-    client_secret = args.client_secret or _read_env("CHROME_OAUTH_CLIENT_SECRET")
-    refresh_token = args.refresh_token or _read_env("CHROME_OAUTH_REFRESH_TOKEN")
-    assert client_id and client_secret and refresh_token
-    return exchange_refresh_for_access(client_id, client_secret, refresh_token)
+def cmd_insert(args: argparse.Namespace) -> int:
+    """POST /items — creates a new CWS item. CWS assigns extension ID.
+
+    Useful for first-time uploads. publisherEmail required when using SA mode.
+    Prints the new extension ID — save it as CHROME_EXTENSION_ID for future
+    uploads.
+    """
+    zip_path = Path(args.zip).resolve()
+    if not zip_path.is_file():
+        print(f"zip not found: {zip_path}", file=sys.stderr)
+        return 2
+    access = get_access_token(args)
+    body = zip_path.read_bytes()
+    url = f"{CWS_UPLOAD_BASE}/items{_join_query(_publisher_query(args))}"
+    headers = {
+        **_bearer(access),
+        "Content-Type": "application/zip",
+        "Content-Length": str(len(body)),
+    }
+    status, _, payload = _http(url, method="POST", headers=headers, data=body)
+    print(f"HTTP {status}  ({len(body)} bytes)")
+    try:
+        decoded = json.loads(payload)
+        print(json.dumps(decoded, indent=2))
+        item_id = decoded.get("id")
+        if item_id:
+            print(f"\nExtension ID assigned: {item_id}")
+            print("Save as CHROME_EXTENSION_ID env / GitHub secret.")
+    except Exception:
+        print(payload.decode("utf-8", "replace"))
+    return 0 if status == 200 else 1
+
+
+def cmd_upload(args: argparse.Namespace) -> int:
+    """PUT zip → /upload/items/{id}. Item must already exist (use insert first)."""
+    item_id = args.item_id or os.environ.get("CHROME_EXTENSION_ID")
+    if not item_id:
+        raise CredentialError(
+            "CHROME_EXTENSION_ID not set. Run `insert` first to create the item."
+        )
+    zip_path = Path(args.zip).resolve()
+    if not zip_path.is_file():
+        print(f"zip not found: {zip_path}", file=sys.stderr)
+        return 2
+    access = get_access_token(args)
+    body = zip_path.read_bytes()
+    url = f"{CWS_UPLOAD_BASE}/items/{item_id}{_join_query(_publisher_query(args))}"
+    headers = {
+        **_bearer(access),
+        "Content-Type": "application/zip",
+        "Content-Length": str(len(body)),
+    }
+    status, _, payload = _http(url, method="PUT", headers=headers, data=body)
+    print(f"HTTP {status}  ({len(body)} bytes uploaded)")
+    try:
+        decoded = json.loads(payload)
+        print(json.dumps(decoded, indent=2))
+        if decoded.get("uploadState", "").upper() == "FAILURE":
+            print("Upload FAILURE — see itemError above.", file=sys.stderr)
+            return 1
+    except Exception:
+        print(payload.decode("utf-8", "replace"))
+    return 0 if status == 200 else 1
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    """GET /items/{id} — print uploadState + status array."""
-    item_id = args.item_id or _read_env("CHROME_EXTENSION_ID")
-    assert item_id
+    """GET /items/{id}?projection=DRAFT."""
+    item_id = args.item_id or os.environ.get("CHROME_EXTENSION_ID")
+    if not item_id:
+        raise CredentialError("CHROME_EXTENSION_ID not set.")
     access = get_access_token(args)
-    url = f"{CWS_API_BASE}/items/{item_id}?projection=DRAFT"
-    status, _, payload = _http_request(url, headers=_bearer(access))
+    qs = _join_query("projection=DRAFT", _publisher_query(args))
+    url = f"{CWS_API_BASE}/items/{item_id}{qs}"
+    status, _, payload = _http(url, headers=_bearer(access))
     print(f"HTTP {status}")
     try:
         print(json.dumps(json.loads(payload), indent=2))
@@ -279,54 +443,20 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0 if status == 200 else 1
 
 
-def cmd_upload(args: argparse.Namespace) -> int:
-    """PUT zip → /upload/...items/{id}."""
-    item_id = args.item_id or _read_env("CHROME_EXTENSION_ID")
-    assert item_id
-    zip_path = Path(args.zip).resolve()
-    if not zip_path.is_file():
-        print(f"zip not found: {zip_path}", file=sys.stderr)
-        return 2
-
-    access = get_access_token(args)
-    url = f"{CWS_UPLOAD_BASE}/items/{item_id}"
-    with zip_path.open("rb") as f:
-        body = f.read()
-    headers = {
-        **_bearer(access),
-        "Content-Type": "application/zip",
-        "Content-Length": str(len(body)),
-    }
-    status, _, payload = _http_request(url, method="PUT", headers=headers, data=body)
-    print(f"HTTP {status}  ({len(body)} bytes uploaded)")
-    try:
-        decoded = json.loads(payload)
-        print(json.dumps(decoded, indent=2))
-        upload_state = decoded.get("uploadState")
-        if upload_state and upload_state.upper() == "FAILURE":
-            print("Upload state FAILURE — see itemError list above.", file=sys.stderr)
-            return 1
-    except Exception:
-        print(payload.decode("utf-8", "replace"))
-    return 0 if status == 200 else 1
-
-
 def cmd_publish(args: argparse.Namespace) -> int:
     """POST /items/{id}/publish?publishTarget=default|trustedTesters."""
-    item_id = args.item_id or _read_env("CHROME_EXTENSION_ID")
-    assert item_id
+    item_id = args.item_id or os.environ.get("CHROME_EXTENSION_ID")
+    if not item_id:
+        raise CredentialError("CHROME_EXTENSION_ID not set.")
     target = args.target
     if target not in ("default", "trustedTesters"):
-        print(f"--target must be default|trustedTesters; got {target}", file=sys.stderr)
+        print("--target must be default|trustedTesters", file=sys.stderr)
         return 2
-
     access = get_access_token(args)
-    url = (
-        f"{CWS_API_BASE}/items/{item_id}/publish"
-        f"?publishTarget={target}"
-    )
+    qs = _join_query(f"publishTarget={target}", _publisher_query(args))
+    url = f"{CWS_API_BASE}/items/{item_id}/publish{qs}"
     headers = {**_bearer(access), "Content-Length": "0"}
-    status, _, payload = _http_request(url, method="POST", headers=headers, data=b"")
+    status, _, payload = _http(url, method="POST", headers=headers, data=b"")
     print(f"HTTP {status}  target={target}")
     try:
         print(json.dumps(json.loads(payload), indent=2))
@@ -335,29 +465,47 @@ def cmd_publish(args: argparse.Namespace) -> int:
     return 0 if status == 200 else 1
 
 
+# ---------------------------------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--client-id", help="Override CHROME_OAUTH_CLIENT_ID env var.")
-    p.add_argument(
-        "--client-secret", help="Override CHROME_OAUTH_CLIENT_SECRET env var."
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--refresh-token", help="Override CHROME_OAUTH_REFRESH_TOKEN env var."
+        "--auth",
+        choices=["auto", "sa", "oauth"],
+        default="auto",
+        help="auth mode (auto picks SA if sa.json exists, else OAuth)",
     )
-    p.add_argument("--item-id", help="Override CHROME_EXTENSION_ID env var.")
+    p.add_argument("--client-id", help="override CHROME_OAUTH_CLIENT_ID (oauth mode)")
+    p.add_argument(
+        "--client-secret", help="override CHROME_OAUTH_CLIENT_SECRET (oauth mode)"
+    )
+    p.add_argument(
+        "--refresh-token", help="override CHROME_OAUTH_REFRESH_TOKEN (oauth mode)"
+    )
+    p.add_argument(
+        "--publisher-email",
+        help="override CHROME_PUBLISHER_EMAIL (SA mode — owner of the CWS dev account)",
+    )
+    p.add_argument("--item-id", help="override CHROME_EXTENSION_ID")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("auth-bootstrap", help="One-time interactive OAuth dance.")
-    sub.add_parser("status", help="GET item state.")
 
-    up = sub.add_parser("upload", help="PUT zip to existing item.")
-    up.add_argument("--zip", required=True, help="Path to packed extension .zip")
+    ins = sub.add_parser("insert", help="POST /items — create a NEW item (assigns ID).")
+    ins.add_argument("--zip", required=True)
+
+    up = sub.add_parser("upload", help="PUT zip — update existing item.")
+    up.add_argument("--zip", required=True)
+
+    sub.add_parser("status", help="GET item state.")
 
     pub = sub.add_parser("publish", help="Publish item.")
     pub.add_argument(
-        "--target",
-        default="default",
-        help="default (public) | trustedTesters (test cohort).",
+        "--target", default="default", help="default | trustedTesters"
     )
 
     return p
@@ -369,10 +517,12 @@ def main() -> int:
         match args.cmd:
             case "auth-bootstrap":
                 return cmd_auth_bootstrap(args)
-            case "status":
-                return cmd_status(args)
+            case "insert":
+                return cmd_insert(args)
             case "upload":
                 return cmd_upload(args)
+            case "status":
+                return cmd_status(args)
             case "publish":
                 return cmd_publish(args)
             case _:
