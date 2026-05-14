@@ -1,0 +1,135 @@
+name: Chrome Web Store Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish_target:
+        description: 'After upload, publish to this target (or skip).'
+        required: true
+        default: 'skip'
+        type: choice
+        options:
+          - skip
+          - trustedTesters
+          - default
+
+permissions:
+  contents: write   # to attach zip to a GitHub Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  store-release:
+    name: Pack + upload + (optional) publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pre-flight — manifest version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST_VERSION=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "FAIL: tag $GITHUB_REF_NAME ($TAG_VERSION) != manifest.json version ($MANIFEST_VERSION)"
+            exit 1
+          fi
+          echo "tag/manifest version match: $TAG_VERSION"
+
+      - name: Pack extension zip
+        id: pack
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('manifest.json'))['version'])")
+          ZIP_NAME="blob-pdf-exporter-v${VERSION}.zip"
+          zip -r "$ZIP_NAME" \
+            manifest.json \
+            src/ \
+            vendor/ \
+            icons/ \
+            LICENSE \
+            README.md \
+            -x "*.DS_Store" "chrome-store-assets/*" "docs/*" "*.md.skeleton*"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          ls -la "$ZIP_NAME"
+          sha256sum "$ZIP_NAME"
+
+      - name: Status (current item state)
+        env:
+          CHROME_OAUTH_CLIENT_ID: ${{ secrets.CHROME_OAUTH_CLIENT_ID }}
+          CHROME_OAUTH_CLIENT_SECRET: ${{ secrets.CHROME_OAUTH_CLIENT_SECRET }}
+          CHROME_OAUTH_REFRESH_TOKEN: ${{ secrets.CHROME_OAUTH_REFRESH_TOKEN }}
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+        run: |
+          if [ -z "$CHROME_EXTENSION_ID" ]; then
+            echo "secrets not configured yet — status step skipped"
+            echo "see docs/store/SETUP.md for one-time setup"
+            exit 0
+          fi
+          python3 scripts/chrome-store-publisher.py status
+
+      - name: Upload to Chrome Web Store
+        env:
+          CHROME_OAUTH_CLIENT_ID: ${{ secrets.CHROME_OAUTH_CLIENT_ID }}
+          CHROME_OAUTH_CLIENT_SECRET: ${{ secrets.CHROME_OAUTH_CLIENT_SECRET }}
+          CHROME_OAUTH_REFRESH_TOKEN: ${{ secrets.CHROME_OAUTH_REFRESH_TOKEN }}
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+        run: |
+          if [ -z "$CHROME_EXTENSION_ID" ]; then
+            echo "secrets not configured yet — upload skipped"
+            exit 0
+          fi
+          python3 scripts/chrome-store-publisher.py upload \
+            --zip "${{ steps.pack.outputs.zip_name }}"
+
+      - name: Publish (workflow_dispatch only, if target != skip)
+        if: |
+          github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.publish_target != 'skip'
+        env:
+          CHROME_OAUTH_CLIENT_ID: ${{ secrets.CHROME_OAUTH_CLIENT_ID }}
+          CHROME_OAUTH_CLIENT_SECRET: ${{ secrets.CHROME_OAUTH_CLIENT_SECRET }}
+          CHROME_OAUTH_REFRESH_TOKEN: ${{ secrets.CHROME_OAUTH_REFRESH_TOKEN }}
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
+        run: |
+          if [ -z "$CHROME_EXTENSION_ID" ]; then
+            echo "secrets not configured yet — publish skipped"
+            exit 0
+          fi
+          python3 scripts/chrome-store-publisher.py publish \
+            --target "${{ github.event.inputs.publish_target }}"
+
+      - name: Attach zip to GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.pack.outputs.zip_name }}
+          generate_release_notes: true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Chrome Web Store Release — v${{ steps.pack.outputs.version }}"
+            echo ""
+            echo "- Zip packed: ${{ steps.pack.outputs.zip_name }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Ref: ${{ github.ref_name }}"
+            if [ "${{ secrets.CHROME_EXTENSION_ID && 'yes' || 'no' }}" = "no" ]; then
+              echo ""
+              echo "**Note:** secrets not configured. See \`docs/store/SETUP.md\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
