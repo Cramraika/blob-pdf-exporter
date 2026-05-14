@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Blob PDF Exporter</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e0e10;
+      --surface: #131315;
+      --surface-2: #1f1f22;
+      --text: #f9f5f8;
+      --muted: #adaaad;
+      --primary: #10B981;
+      --primary-dim: #059669;
+      --accent: #3B82F6;
+      --border: rgba(255, 255, 255, 0.08);
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 320px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    main { padding: 16px; }
+    h1 {
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0 0 4px;
+      letter-spacing: -0.01em;
+    }
+    .subtitle {
+      font-size: 11px;
+      color: var(--muted);
+      margin: 0 0 14px;
+    }
+    button {
+      display: block;
+      width: 100%;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: none;
+      background: var(--primary);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s ease;
+      font-family: inherit;
+    }
+    button:hover:not(:disabled) { background: var(--primary-dim); }
+    button:disabled { opacity: 0.55; cursor: progress; }
+    .status {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--muted);
+      min-height: 36px;
+    }
+    .status.error { color: var(--danger); border-color: rgba(248, 113, 113, 0.3); }
+    .status.success { color: var(--primary); border-color: rgba(16, 185, 129, 0.3); }
+    .meta {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .meta a { color: var(--accent); text-decoration: none; }
+    .meta a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Blob PDF Exporter</h1>
+    <p class="subtitle">Scans this page for <code>blob:</code> images and combines them into a PDF.</p>
+    <button id="run">Export to PDF</button>
+    <div id="status" class="status">Ready.</div>
+    <div class="meta">
+      <span>v0.1.0 · MIT</span>
+      <a href="https://github.com/sponsors/Cramraika" target="_blank" rel="noopener">Sponsor</a>
+    </div>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["*.md", "docs/**", "chrome-store-assets/**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: Validate extension
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate manifest.json
+        run: |
+          python3 -c "import json,sys;json.load(open('manifest.json'));print('manifest.json OK')"
+
+      - name: Syntax check src/*.js
+        run: |
+          for f in src/*.js; do
+            node --check "$f"
+            echo "  $f OK"
+          done
+
+      - name: Validate vendor + icons present
+        run: |
+          test -f vendor/jspdf.umd.min.js || (echo "MISSING vendor/jspdf.umd.min.js"; exit 1)
+          for size in 16 48 128; do
+            test -f "icons/icon-${size}.png" || (echo "MISSING icons/icon-${size}.png"; exit 1)
+          done
+          echo "vendor + icons OK"
+
+      - name: Web-Extensions linter (optional, non-blocking)
+        continue-on-error: true
+        run: |
+          npx --yes -p web-ext web-ext lint --self-hosted --source-dir . || true
+
+      - name: Pack zip (artifact)
+        run: |
+          zip -r blob-pdf-exporter-${{ github.sha }}.zip \
+            manifest.json \
+            src/ \
+            vendor/ \
+            icons/ \
+            LICENSE \
+            README.md \
+            -x "*.DS_Store" "chrome-store-assets/*" "docs/*" "*.md"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blob-pdf-exporter-zip
+          path: blob-pdf-exporter-${{ github.sha }}.zip
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Blob PDF Exporter — CI"
+            echo ""
+            echo "- manifest.json: validated"
+            echo "- src/*.js: syntax-checked"
+            echo "- vendor/jspdf.umd.min.js + icons: present"
+            echo "- web-ext lint: non-blocking advisory"
+            echo "- Packed zip available as artifact"
+          } >> "$GITHUB_STEP_SUMMARY"
