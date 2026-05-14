@@ -29,6 +29,10 @@ Coming soon — pending Chrome Web Store review.
 4. Click **Load unpacked** → select this repo's folder.
 5. The Blob PDF Exporter icon appears in your toolbar.
 
+### From a packaged zip
+
+Download `blob-pdf-exporter-vX.Y.Z.zip` from the [Releases page](https://github.com/Cramraika/blob-pdf-exporter/releases), unzip, then Load unpacked the extracted folder per above.
+
 ## Usage
 
 1. Open a page where document pages render as `blob:` images (e.g., a document viewer).
@@ -69,16 +73,31 @@ Document viewers (some PDF readers, slide-deck embeds, scanned-doc apps) intenti
 git clone https://github.com/Cramraika/blob-pdf-exporter
 cd blob-pdf-exporter
 # Load unpacked in chrome://extensions/ → Developer mode → Load unpacked
+make help              # see all release commands
+make lint              # validate manifest.json + JS syntax
+make pack              # produce dist/blob-pdf-exporter-vX.Y.Z.zip
 ```
 
 No build step. Pure vanilla JS + HTML. Edits in `src/` and `vendor/` apply on extension reload.
 
+### Release automation
+
+This repo ships with full Chrome Web Store auto-deploy:
+
+- **`make tag`** — bumps version + tags + pushes → CI auto-uploads to Web Store.
+- **`gh workflow run store-release.yml -f publish_target=default`** — promotes the uploaded draft to public.
+- See [`docs/store/RELEASE_RUNBOOK.md`](docs/store/RELEASE_RUNBOOK.md) for the full release flow.
+- See [`docs/store/SETUP.md`](docs/store/SETUP.md) for one-time OAuth setup (~30 min, then forever-automatic).
+- See [`docs/store/AUTOMATION_ENVELOPE.md`](docs/store/AUTOMATION_ENVELOPE.md) for the honest scope of what's API-driven vs browser-only.
+
+Pattern mirrors [Pulseboard](https://github.com/Cramraika/pulseboard)'s Google Play auto-deploy (`docs/play/`).
+
 ### CI
 
-`.github/workflows/ci.yml` runs:
-- `manifest.json` JSON validity
-- JS syntax check on all `src/*.js`
-- File-presence check on icons + vendor
+Two GitHub Actions workflows:
+
+- **`.github/workflows/ci.yml`** runs on every push/PR: validates manifest, JS syntax, vendor + icons presence, packs zip artifact.
+- **`.github/workflows/store-release.yml`** runs on tag push (`v*`) or workflow_dispatch: pre-flight version check, pack, upload to Chrome Web Store, optionally publish, attach zip to GitHub Release.
 
 ## Sponsor
 
