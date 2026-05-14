@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Blob PDF Exporter",
   "short_name": "Blob PDF",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Combine blob: images on the current page into a single PDF. Useful for document viewers that render pages as blob URLs.",
   "author": "Chinmay Ramraika / Vagary Labs",
   "homepage_url": "https://github.com/Cramraika/blob-pdf-exporter",
