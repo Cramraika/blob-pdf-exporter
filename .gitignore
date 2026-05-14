@@ -7,12 +7,13 @@ Thumbs.db
 .idea/
 *.swp
 
-# Build artefacts (none today; reserved)
+# Build artefacts (dist/ from `make pack`)
 dist/
 *.zip
 *.crx
 *.pem
 chrome-store-package.zip
+blob-pdf-exporter-*.zip
 
 # Local Claude / Serena state
 .claude/settings.local.json
