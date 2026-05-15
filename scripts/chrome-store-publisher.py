@@ -395,26 +395,38 @@ def cmd_insert(args: argparse.Namespace) -> int:
 
 
 def cmd_upload(args: argparse.Namespace) -> int:
-    """PUT zip → /upload/items/{id}. Item must already exist (use insert first)."""
+    """PUT package → /upload/items/{id}. Item must already exist (use insert first).
+
+    Accepts either a .zip (CWS-managed signing) or a .crx (verified CRX uploads).
+    A .crx must be signed with the RSA key registered on the dashboard's
+    Verified CRX Uploads section, else CWS rejects it.
+    """
     item_id = args.item_id or os.environ.get("CHROME_EXTENSION_ID")
     if not item_id:
         raise CredentialError(
             "CHROME_EXTENSION_ID not set. Run `insert` first to create the item."
         )
-    zip_path = Path(args.zip).resolve()
-    if not zip_path.is_file():
-        print(f"zip not found: {zip_path}", file=sys.stderr)
+    pkg_path = Path(args.zip).resolve()
+    if not pkg_path.is_file():
+        print(f"package not found: {pkg_path}", file=sys.stderr)
         return 2
+    is_crx = pkg_path.suffix.lower() == ".crx"
     access = get_access_token(args)
-    body = zip_path.read_bytes()
+    body = pkg_path.read_bytes()
     url = f"{CWS_UPLOAD_BASE}/items/{item_id}{_join_query(_publisher_query(args))}"
     headers = {
         **_bearer(access),
-        "Content-Type": "application/zip",
         "Content-Length": str(len(body)),
     }
+    if is_crx:
+        # Verified CRX upload — per CWS docs the raw-upload headers are required.
+        headers["Content-Type"] = "application/x-chrome-extension"
+        headers["X-Goog-Upload-Protocol"] = "raw"
+        headers["X-Goog-Upload-File-Name"] = pkg_path.name
+    else:
+        headers["Content-Type"] = "application/zip"
     status, _, payload = _http(url, method="PUT", headers=headers, data=body)
-    print(f"HTTP {status}  ({len(body)} bytes uploaded)")
+    print(f"HTTP {status}  ({len(body)} bytes uploaded, {'CRX' if is_crx else 'ZIP'})")
     try:
         decoded = json.loads(payload)
         print(json.dumps(decoded, indent=2))

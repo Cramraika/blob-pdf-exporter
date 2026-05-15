@@ -55,6 +55,31 @@ jobs:
           chmod 600 "$RUNNER_TEMP/cws/sa.json"
           echo "CHROME_SA_JSON=$RUNNER_TEMP/cws/sa.json" >> "$GITHUB_ENV"
 
+      - name: Decode CRX signing key
+        env:
+          CHROME_CRX_PRIVATE_KEY_B64: ${{ secrets.CHROME_CRX_PRIVATE_KEY_B64 }}
+          CRX_OPTED_IN: ${{ vars.CRX_OPTED_IN }}
+        run: |
+          # Verified CRX uploads is a two-gate switch:
+          #   1. CHROME_CRX_PRIVATE_KEY_B64 secret must be set, AND
+          #   2. CRX_OPTED_IN repo variable must be 'true' (operator flips
+          #      this AFTER pasting the public key in the dashboard's
+          #      Verified CRX Uploads section — see docs/store/SETUP.md).
+          # Until both are satisfied, upload stays ZIP (CWS-managed signing).
+          if [ "$CRX_OPTED_IN" != "true" ]; then
+            echo "CRX_OPTED_IN != true — upload will use ZIP (pre-opt-in mode)"
+            echo "CRX_KEY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ -z "$CHROME_CRX_PRIVATE_KEY_B64" ]; then
+            echo "::warning::CRX_OPTED_IN=true but CHROME_CRX_PRIVATE_KEY_B64 missing"
+            echo "CRX_KEY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$CHROME_CRX_PRIVATE_KEY_B64" | base64 -d > "$RUNNER_TEMP/cws/crx-key.pem"
+          chmod 600 "$RUNNER_TEMP/cws/crx-key.pem"
+          echo "CRX_KEY=$RUNNER_TEMP/cws/crx-key.pem" >> "$GITHUB_ENV"
+
       - name: Pre-flight — manifest version matches tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -84,6 +109,29 @@ jobs:
           ls -la "$ZIP_NAME"
           sha256sum "$ZIP_NAME"
 
+      - name: Sign CRX (verified CRX uploads)
+        id: crx
+        if: env.CRX_KEY != ''
+        run: |
+          CRX_NAME="blob-pdf-exporter-v${{ steps.pack.outputs.version }}.crx"
+          python3 scripts/pack-crx.py \
+            --zip "${{ steps.pack.outputs.zip_name }}" \
+            --key "$CRX_KEY" \
+            --out "$CRX_NAME"
+          echo "crx_name=$CRX_NAME" >> "$GITHUB_OUTPUT"
+          ls -la "$CRX_NAME"
+
+      - name: Choose upload package (CRX if signed, else ZIP)
+        id: pkg
+        run: |
+          if [ -n "${{ steps.crx.outputs.crx_name }}" ]; then
+            echo "package=${{ steps.crx.outputs.crx_name }}" >> "$GITHUB_OUTPUT"
+            echo "Using signed CRX: ${{ steps.crx.outputs.crx_name }}"
+          else
+            echo "package=${{ steps.pack.outputs.zip_name }}" >> "$GITHUB_OUTPUT"
+            echo "Using ZIP: ${{ steps.pack.outputs.zip_name }}"
+          fi
+
       - name: Status (current item state)
         if: env.CHROME_SA_JSON != ''
         env:
@@ -99,7 +147,7 @@ jobs:
           CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
         run: |
           python3 scripts/chrome-store-publisher.py upload \
-            --zip "${{ steps.pack.outputs.zip_name }}"
+            --zip "${{ steps.pkg.outputs.package }}"
 
       - name: Publish (workflow_dispatch only, if target != skip)
         if: |

@@ -28,10 +28,17 @@ pack:                       ## Build dist/blob-pdf-exporter-v$(VERSION).zip from
 	@ls -la $(ZIP)
 	@shasum -a 256 $(ZIP)
 
+CRX        := dist/blob-pdf-exporter-v$(VERSION).crx
+CRX_KEY    ?= $(HOME)/.config/cws-crx/privatekey.pem
+
+.PHONY: crx
+crx: pack                   ## Sign dist/*.crx from the zip (verified CRX uploads).
+	@python3 scripts/pack-crx.py --zip $(ZIP) --key $(CRX_KEY) --out $(CRX)
+
 .PHONY: clean
-clean:                      ## Remove dist/ and any local zips.
+clean:                      ## Remove dist/ and any local packages.
 	@rm -rf dist/
-	@rm -f blob-pdf-exporter-*.zip
+	@rm -f blob-pdf-exporter-*.zip blob-pdf-exporter-*.crx
 
 # ---------------------------------------------------------------------------
 # Chrome Web Store API ops (require env vars per docs/store/SETUP.md)
@@ -47,6 +54,7 @@ doctor:                     ## Verify env + tooling for a release.
 	@if [ -n "$$CHROME_OAUTH_CLIENT_SECRET" ]; then echo "CHROME_OAUTH_CLIENT_SECRET: set"; else echo "CHROME_OAUTH_CLIENT_SECRET: MISSING"; fi
 	@if [ -n "$$CHROME_OAUTH_REFRESH_TOKEN" ]; then echo "CHROME_OAUTH_REFRESH_TOKEN: set"; else echo "CHROME_OAUTH_REFRESH_TOKEN: MISSING"; fi
 	@if [ -n "$$CHROME_EXTENSION_ID" ];        then echo "CHROME_EXTENSION_ID:        set"; else echo "CHROME_EXTENSION_ID:        MISSING"; fi
+	@if [ -f "$(CRX_KEY)" ];                   then echo "CRX signing key:            present ($(CRX_KEY))"; else echo "CRX signing key:            MISSING"; fi
 	@echo "(see docs/store/SETUP.md if any are MISSING)"
 
 .PHONY: auth-bootstrap
@@ -58,8 +66,12 @@ status:                     ## GET item state (uploadState + status array).
 	@$(PUBLISHER) status
 
 .PHONY: upload
-upload: pack                ## Pack + PUT zip to Chrome Web Store (no publish).
+upload: pack                ## Pack + PUT zip to Chrome Web Store (pre-opt-in).
 	@$(PUBLISHER) upload --zip $(ZIP)
+
+.PHONY: upload-crx
+upload-crx: crx             ## Sign + PUT crx to Chrome Web Store (verified CRX uploads).
+	@$(PUBLISHER) upload --zip $(CRX)
 
 .PHONY: publish-trusted
 publish-trusted:            ## Publish current draft → trustedTesters track.
@@ -74,10 +86,10 @@ publish-public:             ## Publish current draft → public (PRODUCTION).
 # ---------------------------------------------------------------------------
 
 .PHONY: ship-trusted
-ship-trusted: upload publish-trusted ## Pack + upload + publish to trustedTesters.
+ship-trusted: upload-crx publish-trusted ## Sign crx + upload + publish to trustedTesters.
 
 .PHONY: ship-public
-ship-public: upload publish-public ## Pack + upload + publish public. ⚠️ Reaches end users.
+ship-public: upload-crx publish-public ## Sign crx + upload + publish public. ⚠️ Reaches end users.
 
 # ---------------------------------------------------------------------------
 # Tag flow (triggers GitHub Actions store-release.yml)
